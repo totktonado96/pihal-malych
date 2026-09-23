@@ -1,0 +1,5 @@
+project_id = "leniny-jokes"
+
+# Бот должен принимать запросы от Telegram без JWT-авторизации.
+[functions.bot]
+verify_jwt = false

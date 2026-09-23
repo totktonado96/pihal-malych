@@ -1,0 +1,7 @@
+# личные настройки (ники) — образец в config.example.ts
+supabase/functions/bot/config.ts
+.env
+.env.*
+.DS_Store
+.claude/
+supabase/.temp/
