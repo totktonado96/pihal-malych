@@ -702,9 +702,14 @@ export async function paMemory(query: string, lite = 0): Promise<{ text: string;
   const works = await allWork();
   if (works.length) parts.push("Работа (все): " + works.map((w) => `${w.name} [${WORK_KIND[w.kind] ?? w.kind}, ${WORK_STATUS[w.status] ?? w.status}]`).join("; "));
   for (const w of workMentioned(works, query).slice(0, 3)) parts.push("Упомянута работа:\n" + await workCard(w));
-  const cts = lite ? [] : await contactsMentioned(query);
+  // книжка: по словам сообщения, по основным именам упомянутых (в т.ч. по прозвищу) и по последним его репликам —
+  // чтобы «а номер его есть?» находило того, о ком только что говорили
+  const { data: lastUser } = lite ? { data: [] } : await supabase.from("pa_history").select("text").eq("role", "user").order("id", { ascending: false }).limit(3);
+  // deno-lint-ignore no-explicit-any
+  const ctsQuery = [query, ...mentioned.map((p: any) => p.name), ...(lastUser ?? []).map((h: any) => h.text)].join(" ");
+  const cts = lite ? [] : await contactsMentioned(ctsQuery);
   if (cts.length) {
-    parts.push("Телефонная книжка (совпадения по именам в сообщении):\n" + cts.map((c) => `${c.name}${c.org ? ` (${c.org})` : ""}: ${c.phones.join(", ")}${c.note ? ` — ${trunc(c.note, 100)}` : ""}`).join("\n"));
+    parts.push("Телефонная книжка (совпадения по именам из сообщения и недавнего разговора):\n" + cts.map((c) => `${c.name}${c.org ? ` (${c.org})` : ""}: ${c.phones.join(", ")}${c.note ? ` — ${trunc(c.note, 100)}` : ""}`).join("\n"));
   }
   const { data: prom } = await supabase.from("pa_promises").select("id, who, person, text, due_at").eq("done", false).order("id").limit(40);
   // deno-lint-ignore no-explicit-any
@@ -1126,7 +1131,7 @@ export async function contactsMentioned(text: string): Promise<any[]> {
   }
   const words = text.toLowerCase().split(/[^а-яёa-z0-9]+/i).filter((w) => w.length >= 4 && !/^\d+$/.test(w));
   if (!words.length) return out;
-  const stems = [...new Set(words.map((w) => w.slice(0, Math.max(4, w.length - 2))))].slice(0, 12).map((st) => st.replace(/[%,()"\\]/g, ""));
+  const stems = [...new Set(words.map((w) => w.slice(0, Math.max(4, w.length - 2))))].slice(0, 20).map((st) => st.replace(/[%,()"\\]/g, ""));
   const or = stems.flatMap((st) => [`name.ilike."${st}%"`, `name.ilike."% ${st}%"`]).join(",");
   const { data } = await supabase.from("pa_contacts").select("name, phones, org, note").or(or).limit(8);
   return [...out, ...(data ?? [])];
