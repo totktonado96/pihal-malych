@@ -626,6 +626,13 @@ export async function handleConfirm(chatId: number, text: string): Promise<boole
       if (files?.length) await supabase.storage.from("pa-docs").remove(files.map((f) => f.path));
       await supabase.from("pa_docs").delete().in("id", ids);
       msg = ds?.length ? `🗑 Удалил со сканами: ${ds.map((d) => d.title).join(", ")}` : "Уже удалено.";
+    } else if (kind === "memdel") { // из /memcheck: h12,n34,c5 — реплика истории, заметка, контакт
+      const ofKind = (pre: string) => idStr.split(",").filter((x) => x.startsWith(pre)).map((x) => Number(x.slice(1))).filter(Boolean);
+      const [h, n, c] = [ofKind("h"), ofKind("n"), ofKind("c")];
+      if (h.length) await supabase.from("pa_history").delete().in("id", h);
+      if (n.length) await supabase.from("pa_notes").delete().in("id", n);
+      if (c.length) await supabase.from("pa_contacts").delete().in("id", c);
+      msg = `🗑 Удалил: ${[h.length && `реплик ${h.length}`, n.length && `заметок ${n.length}`, c.length && `контактов ${c.length}`].filter(Boolean).join(", ")}`;
     } else if (kind === "notedel") {
       await supabase.from("pa_notes").delete().in("id", ids);
       msg = `🗑 Удалил заметок: ${ids.length}`;
@@ -742,6 +749,65 @@ export async function paAsk(system: string, query: string, build: (memText: stri
     console.error("pa: prompt blocked, lite", lite);
   }
   return { raw: null, mem: { text: "", noteIds: new Set<number>() } };
+}
+
+// --- /memcheck: какая запись памяти не даёт Google принять запрос (PROHIBITED_CONTENT) ---
+// h — реплика истории, n — заметка, c — контакт
+type MemItem = { key: string; label: string; line: string };
+
+// запрос с этим куском памяти отклонён по содержанию? true — да, false — прошёл, null — модели не ответили
+async function memBlocked(header: string, items: MemItem[]): Promise<boolean | null> {
+  const r = await geminiAsk(PA_SYSTEM, [{ text: `Сейчас: ${ashNowText()}\n\n${header}\n${items.map((i) => i.line).join("\n")}\n\nНовое сообщение: «проверка»` }],
+    { models: PA_MODELS_CHEAP, maxTokens: 300, timeoutMs: 15_000, deadlineMs: 30_000 });
+  return r === "blocked" ? true : r === null ? null : false;
+}
+
+// делим кусок пополам, пока не найдём записи, из-за которых блок
+async function memBisect(header: string, items: MemItem[], unknown: { n: number }): Promise<MemItem[]> {
+  if (!items.length) return [];
+  const b = await memBlocked(header, items);
+  if (b === null) {
+    unknown.n++;
+    return [];
+  }
+  if (!b) return [];
+  if (items.length === 1) return items;
+  const mid = Math.ceil(items.length / 2);
+  const found = [...await memBisect(header, items.slice(0, mid), unknown), ...await memBisect(header, items.slice(mid), unknown)];
+  return found.length ? found : items; // по отдельности проходят, блокирует сочетание — отдаём весь кусок
+}
+
+export async function paMemCheck(chatId: number) {
+  const full = await paMemory("проверка памяти");
+  const whole = await geminiAsk(PA_SYSTEM, [{ text: `${full.text}\n\nНовое сообщение: «проверка»` }],
+    { models: PA_MODELS_CHEAP, maxTokens: 300, timeoutMs: 15_000, deadlineMs: 30_000 });
+  if (whole === null) return void (await bot.api.sendMessage(chatId, `Модели сейчас не отвечают${geminiLastFail ? ` (${geminiLastFail})` : ""}. Повтори /memcheck позже.`));
+  if (whole !== "blocked") return void (await bot.api.sendMessage(chatId, "✅ Память проходит целиком — Google ничего не блокирует."));
+
+  const { data: hist } = await supabase.from("pa_history").select("id, role, text").order("id", { ascending: false }).limit(20);
+  const { data: fresh } = await supabase.from("pa_notes").select("id, kind, text, place, created_at")
+    .gte("created_at", new Date(Date.now() - 864e5).toISOString()).order("id", { ascending: false }).limit(15);
+  const { data: lastUser } = await supabase.from("pa_history").select("text").eq("role", "user").order("id", { ascending: false }).limit(3);
+  // deno-lint-ignore no-explicit-any
+  const cts = await contactsMentioned((lastUser ?? []).map((h: any) => h.text).join(" "));
+  const sections: [string, MemItem[]][] = [
+    // deno-lint-ignore no-explicit-any
+    ["Недавний диалог:", (hist ?? []).reverse().map((h: any) => ({ key: `h${h.id}`, label: `реплика #${h.id}`, line: `${h.role === "user" ? "Он" : "Ты"}: ${trunc(h.text, 400)}` }))],
+    // deno-lint-ignore no-explicit-any
+    ["Записано за последние сутки:", (fresh ?? []).map((n: any) => ({ key: `n${n.id}`, label: `заметка #${n.id}`, line: `#${n.id} [${n.kind}, ${fmtAsh(n.created_at)}${n.place ? `, ${n.place}` : ""}] ${trunc(n.text, 400)}` }))],
+    ["Телефонная книжка (совпадения по именам из сообщения и недавнего разговора):", cts.map((c) => ({ key: `c${c.id}`, label: `контакт ${trunc(c.name, 30)} #${c.id}`, line: `${c.name}${c.org ? ` (${c.org})` : ""}: ${c.phones.join(", ")}${c.note ? ` — ${trunc(c.note, 100)}` : ""}` }))],
+  ];
+  const unknown = { n: 0 };
+  const bad: MemItem[] = [];
+  for (const [header, items] of sections) bad.push(...await memBisect(header, items, unknown));
+  const busy = unknown.n ? `\n(${unknown.n} проверок не прошло — модели перегружены; если ничего не нашёл, повтори /memcheck позже.)` : "";
+  if (!bad.length) {
+    return void (await bot.api.sendMessage(chatId, "Целиком память блокируется, но ни история, ни свежие заметки, ни контакты по отдельности — нет. Значит, мешает сочетание или другой раздел (люди, места, дела)." + busy));
+  }
+  const list = bad.slice(0, 15).map((b) => `• ${b.label}: ${trunc(b.line, 150)}`).join("\n");
+  const opts = bad.slice(0, 8).map((b) => ({ label: `🗑 ${b.label}`, act: `memdel:${b.key}` }));
+  if (bad.length > 1) opts.unshift({ label: `🗑 Удалить все (${bad.length})`, act: `memdel:${bad.map((b) => b.key).join(",")}` });
+  await askConfirm(chatId, `🔎 Google отклоняет запросы из-за этих записей (пока они есть, я отвечаю без истории диалога и книжки):\n${list}${bad.length > 15 ? `\n…и ещё ${bad.length - 15}` : ""}${busy}\n\nУдалить?`, opts);
 }
 
 // следующая дата повторяющегося напоминания
@@ -1123,7 +1189,7 @@ export async function contactsMentioned(text: string): Promise<any[]> {
   const out: any[] = [];
   const digits = (text.match(/\+?\d[\d\s()-]{5,}\d/g) ?? []).map((d) => d.replace(/\D/g, "")).filter((d) => d.length >= 6);
   if (digits.length) {
-    const { data } = await supabase.from("pa_contacts").select("name, phones, org, note").limit(20000);
+    const { data } = await supabase.from("pa_contacts").select("id, name, phones, org, note").limit(20000);
     const tail = (x: string) => x.replace(/\D/g, "").slice(-8);
     // deno-lint-ignore no-explicit-any
     out.push(...(data ?? []).filter((c: any) => (c.phones ?? []).some((p: string) =>
@@ -1133,7 +1199,7 @@ export async function contactsMentioned(text: string): Promise<any[]> {
   if (!words.length) return out;
   const stems = [...new Set(words.map((w) => w.slice(0, Math.max(4, w.length - 2))))].slice(0, 20).map((st) => st.replace(/[%,()"\\]/g, ""));
   const or = stems.flatMap((st) => [`name.ilike."${st}%"`, `name.ilike."% ${st}%"`]).join(",");
-  const { data } = await supabase.from("pa_contacts").select("name, phones, org, note").or(or).limit(8);
+  const { data } = await supabase.from("pa_contacts").select("id, name, phones, org, note").or(or).limit(8);
   return [...out, ...(data ?? [])];
 }
 
@@ -1332,6 +1398,7 @@ export async function setPaCommands(chatId: number) {
     { command: "docs", description: "Документы и сканы" },
     { command: "pass", description: "Доступы и пароли" },
     { command: "mem", description: "Выгрузить всю память" },
+    { command: "memcheck", description: "Найти, что в памяти блокирует Google" },
     { command: "forget", description: "Удаление" },
     { command: "pasum", description: "Утренняя сводка вкл/выкл" },
     { command: "paeve", description: "Вечерняя проверка вкл/выкл" },
@@ -1432,6 +1499,13 @@ export function registerAssistant() {
     if (found.length === 1) await sendSecret(ctx.chat.id, found[0]);
     else if (found.length > 1) await ctx.reply("Подходит несколько:\n" + found.map((s) => `• ${s.label}`).join("\n"));
     else await ctx.reply("Не нашёл. Список — /pass");
+  });
+
+  // --- /memcheck — найти запись памяти, из-за которой Google отклоняет запросы ---
+  bot.command("memcheck", async (ctx) => {
+    if (!(await isPaOwner(ctx))) return;
+    await ctx.reply("🔎 Проверяю память по кусочкам — минута-две.");
+    await background(paMemCheck(ctx.chat.id));
   });
 
   // --- /mem — выгрузка всей памяти файлом (без паролей: только их названия) ---
