@@ -621,6 +621,9 @@ export type GeminiOpts = {
 // один запрос к Gemini. parts — текст и/или аудио. Возвращает: строку — ответ; "blocked" — Google отклонил
 // сам запрос по содержанию (PROHIBITED_CONTENT/SAFETY — другие модели откажут так же);
 // null — сеть/лимит/503, стоит попробовать другую модель
+// почему последний запрос не удался (для сообщения пользователю): «модель: причина»
+export let geminiLastFail = "";
+
 export async function geminiCall(model: string, system: string, parts: unknown[], o: GeminiOpts): Promise<string | null> {
   const safetySettings = [
     "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
@@ -645,6 +648,7 @@ export async function geminiCall(model: string, system: string, parts: unknown[]
     });
     if (!res.ok) {
       console.error("gemini", model, res.status, (await res.text()).slice(0, 200));
+      geminiLastFail = `${model}: ${res.status === 429 ? "лимит (429)" : res.status === 503 ? "перегружена (503)" : `HTTP ${res.status}`}`;
       return null; // 404 — модели нет, 429 — лимит, 503 — перегружена
     }
     const data = await res.json();
@@ -653,14 +657,18 @@ export async function geminiCall(model: string, system: string, parts: unknown[]
     const parts2: any[] = cand?.content?.parts ?? [];
     const out = parts2.filter((p) => !p.thought).map((p) => p.text ?? "").join("")
       .trim().replace(/^["«»“”'\s]+|["«»“”'\s]+$/g, "").trim();
-    if (out) return trunc(out, o.json ? 4000 : (o.maxChars ?? 300));
+    // JSON не режем: обрезанный JSON — битый, его всё равно отбракуют
+    if (out && o.json && cand?.finishReason === "MAX_TOKENS") console.error("gemini cut by MAX_TOKENS", model, out.length);
+    if (out) return o.json ? out : trunc(out, o.maxChars ?? 300);
     const why = data.promptFeedback?.blockReason ?? cand?.finishReason ?? "?";
     console.error("gemini empty", model, why);
+    geminiLastFail = `${model}: ${why === "SPII" ? "Google заблокировал ответ — личные данные (SPII)" : why === "PROHIBITED_CONTENT" ? "Google отклонил запрос по содержанию (PROHIBITED_CONTENT)" : why === "MAX_TOKENS" ? "не хватило токенов на ответ" : `пустой ответ (${why})`}`;
     const blocked = !!data.promptFeedback?.blockReason ||
       ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"].includes(cand?.finishReason);
     return blocked ? "blocked" : null;
   } catch (e) {
     console.error("gemini failed", model, String(e).slice(0, 200));
+    geminiLastFail = `${model}: ${/timeout|abort/i.test(String(e)) ? "таймаут" : "ошибка сети"}`;
     return null;
   }
 }
@@ -669,6 +677,7 @@ export async function geminiCall(model: string, system: string, parts: unknown[]
 // общий дедлайн. "blocked" — отказ по содержанию, дальше не перебираем. null — никто не ответил.
 export async function geminiAsk(system: string, parts: unknown[], o: GeminiOpts = {}): Promise<string | null> {
   if (!GEMINI_KEY) return null;
+  geminiLastFail = "";
   const deadline = Date.now() + (o.deadlineMs ?? 30_000);
   for (let round = 0; round < 2; round++) {
     for (const model of o.models ?? GEMINI_MODELS) {
@@ -677,6 +686,7 @@ export async function geminiAsk(system: string, parts: unknown[], o: GeminiOpts 
       const r = await geminiCall(model, system, parts, { ...o, timeoutMs: Math.min(o.timeoutMs ?? 15_000, left) });
       if (r && r !== "blocked" && o.accept && !o.accept(r)) {
         console.error("gemini rejected output", model, r.slice(0, 200));
+        geminiLastFail = `${model}: битый ответ (${r.length} симв.)`;
         continue; // зациклилась или битый JSON — следующая модель
       }
       if (r) return r; // текст или "blocked"

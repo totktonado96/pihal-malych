@@ -8,7 +8,7 @@ import { Bot, InlineKeyboard, InputFile, Keyboard, webhookCallback } from "https
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { decodeBase64, encodeBase64 } from "jsr:@std/encoding@1/base64";
 import { ON } from "./config.ts";
-import { BOT_TOKEN, GEMINI_KEY, GEMINI_MODELS_PERSONAL, HTML, SUPER_OWNER, background, bot, esc, geminiText, getFlag, ownerToggle, supabase, trunc, uname } from "./core.ts";
+import { BOT_TOKEN, GEMINI_KEY, GEMINI_MODELS_PERSONAL, type GeminiOpts, HTML, geminiAsk, geminiLastFail, SUPER_OWNER, background, bot, esc, geminiText, getFlag, ownerToggle, supabase, trunc, uname } from "./core.ts";
 
 // ============================================================================================
 // ЛИЧНЫЙ АССИСТЕНТ СОЗДАТЕЛЯ — только в личке и только ему. Без характера: коротко и по делу.
@@ -49,7 +49,7 @@ export const PA_SYSTEM = `Ты — личный ассистент ${ON.gen} в 
 - doc_start {label, due} — хочет сохранить документ или его скан/фото (паспорт, права, страховка, договор): label — название документа, due — дата окончания срока действия (ISO), если назвал. Сами сканы он пришлёт следующими сообщениями, ты их не увидишь.
 - Если он собирается туда, где нужен документ из списка документов (банк, нотариус, посольство, аэропорт, ГАИ, госуслуги, врач), — напомни в reply взять его, а в remind перед таким визитом допиши в text, что взять.
 - Здоровье (лекарства, приёмы, анализы, врачи, самочувствие) — note с kind health; приём лекарств по расписанию — remind с repeat.
-- Телефонная книжка: если упомянутый человек есть в книжке — используй это (номер, организация). Если под имя подходит несколько контактов и из контекста не ясно, кто именно, — спроси в reply, кого он имеет в виду (перечисли варианты с организацией и последними цифрами номера), и не сохраняй факты о нём, пока не уточнит. Когда ясно — в person.fact можно добавить номер из книжки.
+- Телефонная книжка: если упомянутый человек есть в книжке — используй это (номер, организация). Если под имя подходит несколько контактов и из контекста не ясно, кто именно, — спроси в reply, кого он имеет в виду (перечисли варианты с организацией и последними цифрами номера), и не сохраняй факты о нём, пока не уточнит. Когда ясно — в person.fact можно добавить номер из книжки. Всю книжку ты не видишь — только совпадения по именам и номерам из сообщения; массово связывать или перебирать контакты не пытайся — скажи, что искать можно командой /contacts имя, а людей из «Люди (все)» с контактом свяжешь, когда он их упомянет.
 - alias {name, fact} — когда он говорит, что это один и тот же человек («Руся — это Иван», «банкир = Иван»): name — основное имя из списка людей, fact — прозвище. Если человек из списка упомянут по прозвищу — используй основное имя во всех действиях.
 - work {name, kind, status, text} — проект, стартап, клиент, место работы или поездка: name — короткое название (используй существующее из списка «Работа», если это оно); kind: project | client | job | trip; status: idea | active | paused | closed (меняй, когда он говорит «запустили», «закрыли», «на паузе»); text — описание или новые подробности, или пусто.
 - work_member {work, name, fact} — человек в работе: work — название, name — имя человека, fact — роль и условия («партнёр, 30%», «дизайнер», «выбыл»). Для самого человека дополнительно person с этим фактом.
@@ -636,8 +636,11 @@ export async function handleConfirm(chatId: number, text: string): Promise<boole
 }
 
 // --- контекст памяти для запроса ---
-export async function paMemory(query: string): Promise<{ text: string; noteIds: Set<number> }> {
+// lite: 0 — всё; 1 — без недавнего диалога, свежих заметок и телефонной книжки; 2 — только время.
+// Урезаем, когда Google отклоняет запрос по содержанию (PROHIBITED_CONTENT) — см. paAsk.
+export async function paMemory(query: string, lite = 0): Promise<{ text: string; noteIds: Set<number> }> {
   const parts: string[] = [`Сейчас: ${ashNowText()}`];
+  if (lite >= 2) return { text: parts[0], noteIds: new Set() };
   const here = await paLastLoc(60);
   if (here) {
     parts.push(`Он сейчас (по геолокации за последний час): ${here.place || `${here.lat.toFixed(5)}, ${here.lon.toFixed(5)}`}`);
@@ -695,11 +698,11 @@ export async function paMemory(query: string): Promise<{ text: string; noteIds: 
   // deno-lint-ignore no-explicit-any
   const freshNew = (fresh ?? []).filter((n: any) => !noteIds.has(Number(n.id)));
   // deno-lint-ignore no-explicit-any
-  if (freshNew.length) parts.push("Записано за последние сутки:\n" + freshNew.map((n: any) => `#${n.id} [${n.kind}, ${fmtAsh(n.created_at)}${n.place ? `, ${n.place}` : ""}] ${trunc(n.text, 400)}`).join("\n"));
+  if (freshNew.length && !lite) parts.push("Записано за последние сутки:\n" + freshNew.map((n: any) => `#${n.id} [${n.kind}, ${fmtAsh(n.created_at)}${n.place ? `, ${n.place}` : ""}] ${trunc(n.text, 400)}`).join("\n"));
   const works = await allWork();
   if (works.length) parts.push("Работа (все): " + works.map((w) => `${w.name} [${WORK_KIND[w.kind] ?? w.kind}, ${WORK_STATUS[w.status] ?? w.status}]`).join("; "));
   for (const w of workMentioned(works, query).slice(0, 3)) parts.push("Упомянута работа:\n" + await workCard(w));
-  const cts = await contactsMentioned(query);
+  const cts = lite ? [] : await contactsMentioned(query);
   if (cts.length) {
     parts.push("Телефонная книжка (совпадения по именам в сообщении):\n" + cts.map((c) => `${c.name}${c.org ? ` (${c.org})` : ""}: ${c.phones.join(", ")}${c.note ? ` — ${trunc(c.note, 100)}` : ""}`).join("\n"));
   }
@@ -717,8 +720,23 @@ export async function paMemory(query: string): Promise<{ text: string; noteIds: 
   parts.push("Сохранённые доступы (только названия): " + ((secrets ?? []).map((s: any, i: number) => `${i + 1}. ${s.label}`).join("; ") || "(нет)"));
   const { data: hist } = await supabase.from("pa_history").select("role, text").order("id", { ascending: false }).limit(20);
   // deno-lint-ignore no-explicit-any
-  parts.push("Недавний диалог:\n" + ((hist ?? []).reverse().map((h: any) => `${h.role === "user" ? "Он" : "Ты"}: ${trunc(h.text, 400)}`).join("\n") || "(пусто)"));
+  if (!lite) parts.push("Недавний диалог:\n" + ((hist ?? []).reverse().map((h: any) => `${h.role === "user" ? "Он" : "Ты"}: ${trunc(h.text, 400)}`).join("\n") || "(пусто)"));
   return { text: parts.join("\n\n"), noteIds };
+}
+
+// запрос к модели с памятью; если Google отклонил запрос по содержанию — повторяем с урезанной памятью
+// deno-lint-ignore no-explicit-any
+export async function paAsk(system: string, query: string, build: (memText: string) => any[], o: GeminiOpts) {
+  for (let lite = 0; lite <= 2; lite++) {
+    const mem = await paMemory(query, lite);
+    const raw = await geminiAsk(system, build(mem.text), o);
+    if (raw !== "blocked") {
+      if (lite) console.error("pa: prompt passed only with lite memory", lite);
+      return { raw, mem };
+    }
+    console.error("pa: prompt blocked, lite", lite);
+  }
+  return { raw: null, mem: { text: "", noteIds: new Set<number>() } };
 }
 
 // следующая дата повторяющегося напоминания
@@ -1009,18 +1027,16 @@ export async function paHandle(ctx: any) {
     }
   }
 
-  const mem = await paMemory(text || "скриншот");
   const newMsg = heard
     ? `Новое сообщение (голосовое, расшифровка): «${trunc(text, 5000)}»`
     : `Новое сообщение${source ? ` (${source})` : ""}${fileId ? " (прислал картинку/скриншот — она приложена)" : ""}: «${trunc(text, 5000) || "(без подписи)"}»`;
-  parts.push({ text: `${mem.text}\n\n${newMsg}` });
   const simple = paIsSimple(text, !!fileId, !!heard);
-  const raw = await geminiText(PA_SYSTEM, parts, {
-    models: simple ? PA_MODELS_CHEAP : PA_MODELS, json: PA_SCHEMA, temperature: 0.6, maxTokens: 4000, timeoutMs: 25_000, deadlineMs: 55_000,
+  const { raw, mem } = await paAsk(PA_SYSTEM, text || "скриншот", (m) => [...parts, { text: `${m}\n\n${newMsg}` }], {
+    models: simple ? PA_MODELS_CHEAP : PA_MODELS, json: PA_SCHEMA, temperature: 0.6, maxTokens: 8000, timeoutMs: 25_000, deadlineMs: 55_000,
     thinking: "medium", accept: paOutputOk,
   });
   if (!raw) {
-    await bot.api.sendMessage(chatId, "Модели сейчас не отвечают (перегружены или лимит). Повтори чуть позже — ничего не сохранил.");
+    await bot.api.sendMessage(chatId, `Модели не ответили${geminiLastFail ? ` (последняя — ${geminiLastFail})` : ""}. Ничего не сохранил, повтори позже.`);
     return;
   }
   // deno-lint-ignore no-explicit-any
@@ -1094,15 +1110,26 @@ export async function importContacts(list: { name: string; phones: string[]; ema
   return n;
 }
 
-// контакты, чьё имя/фамилия/организация упомянуты в тексте
+// контакты, чьё имя/фамилия упомянуты в тексте (с начала слова, от 4 букв — иначе «как»/«вот» цепляют полкнижки),
+// и контакты по номеру (от 6 цифр подряд — сверяем хвост номера)
 // deno-lint-ignore no-explicit-any
 export async function contactsMentioned(text: string): Promise<any[]> {
-  const words = text.toLowerCase().split(/[^а-яёa-z0-9]+/i).filter((w) => w.length >= 3);
-  if (!words.length) return [];
-  const stems = [...new Set(words.map((w) => w.slice(0, Math.max(3, w.length - 2))))].slice(0, 12);
-  const or = stems.map((st) => `name.ilike.%${st.replace(/[%,()]/g, "")}%`).join(",");
-  const { data } = await supabase.from("pa_contacts").select("name, phones, org, note").or(or).limit(25);
-  return data ?? [];
+  // deno-lint-ignore no-explicit-any
+  const out: any[] = [];
+  const digits = (text.match(/\+?\d[\d\s()-]{5,}\d/g) ?? []).map((d) => d.replace(/\D/g, "")).filter((d) => d.length >= 6);
+  if (digits.length) {
+    const { data } = await supabase.from("pa_contacts").select("name, phones, org, note").limit(20000);
+    const tail = (x: string) => x.replace(/\D/g, "").slice(-8);
+    // deno-lint-ignore no-explicit-any
+    out.push(...(data ?? []).filter((c: any) => (c.phones ?? []).some((p: string) =>
+      tail(p).length >= 6 && digits.some((d) => tail(d).endsWith(tail(p)) || tail(p).endsWith(tail(d))))).slice(0, 5));
+  }
+  const words = text.toLowerCase().split(/[^а-яёa-z0-9]+/i).filter((w) => w.length >= 4 && !/^\d+$/.test(w));
+  if (!words.length) return out;
+  const stems = [...new Set(words.map((w) => w.slice(0, Math.max(4, w.length - 2))))].slice(0, 12).map((st) => st.replace(/[%,()"\\]/g, ""));
+  const or = stems.flatMap((st) => [`name.ilike."${st}%"`, `name.ilike."% ${st}%"`]).join(",");
+  const { data } = await supabase.from("pa_contacts").select("name, phones, org, note").or(or).limit(8);
+  return [...out, ...(data ?? [])];
 }
 
 // ---------- документы: сканы шифруются тем же ключом и лежат в приватном хранилище pa-docs ----------
@@ -1210,10 +1237,9 @@ export async function processDeletions() {
 export async function sendPaEvening() {
   const owner = await paOwnerId();
   if (!owner || !(await getFlag("pa_evening", true))) return;
-  const mem = await paMemory("незакрытые обещания долги дела встречи без времени сроки завтра");
-  const out = await geminiText(
+  const { raw: out } = await paAsk(
     `Ты — личный ассистент ${ON.gen}. Вечерняя проверка. По памяти найди хвосты, о которых стоит напомнить прямо сейчас: обещания, срок которых подходит или прошёл; то, что он обещал и, похоже, не сделал; долги без движения; встречи и дела на завтра; встречи без времени; документы, которые понадобятся завтра. Коротко, списком, по делу. Если ничего важного нет — верни ровно NONE.`,
-    [{ text: mem.text }],
+    "незакрытые обещания долги дела встречи без времени сроки завтра", (m) => [{ text: m }],
     { models: PA_MODELS, temperature: 0.2, maxTokens: 1500, maxChars: 3000, timeoutMs: 30_000, deadlineMs: 90_000 },
   );
   if (out && !/^none\b/i.test(out.trim())) await bot.api.sendMessage(owner, `🌙 На вечер:\n\n${out}`);
@@ -1242,10 +1268,9 @@ export async function processReminders() {
 
 // перед встречей: собрать из памяти всё, что касается встречи и людей
 export async function sendMeetingBrief(owner: number, topic: string) {
-  const mem = await paMemory(topic);
-  const out = await geminiText(
+  const { raw: out } = await paAsk(
     `Ты — личный ассистент ${ON.gen}. Через час у него встреча (тема ниже). По его памяти собери, что важно знать перед ней: о чём договаривались раньше, что обещали он и ему, долги и деньги с этими людьми, открытые вопросы, что взять с собой (включая документы из списка документов, если они понадобятся). Коротко, списком. Если в памяти ничего по теме нет — верни пустую строку.`,
-    [{ text: `Встреча: ${topic}\n\n${mem.text}` }],
+    topic, (m) => [{ text: `Встреча: ${topic}\n\n${m}` }],
     { models: PA_MODELS, temperature: 0.2, maxTokens: 1200, maxChars: 2500, timeoutMs: 30_000, deadlineMs: 90_000 },
   );
   if (out && out.trim()) await bot.api.sendMessage(owner, `📋 К встрече:\n\n${out}`);
@@ -1284,8 +1309,7 @@ export async function sendPaWeekly() {
 export async function sendPaSummary() {
   const owner = await paOwnerId();
   if (!owner || !(await getFlag("pa_summary", true))) return;
-  const mem = await paMemory("встречи сроки дедлайны договорённости на сегодня и ближайшие дни");
-  const out = await geminiText(PA_SUMMARY_SYSTEM, [{ text: mem.text }], {
+  const { raw: out } = await paAsk(PA_SUMMARY_SYSTEM, "встречи сроки дедлайны договорённости на сегодня и ближайшие дни", (m) => [{ text: m }], {
     models: PA_MODELS, temperature: 0.2, maxTokens: 1500, maxChars: 3500, timeoutMs: 30_000, deadlineMs: 90_000,
   });
   if (out) await bot.api.sendMessage(owner, `☀️ Сводка на ${ashParts().date}\n\n${out}`);
