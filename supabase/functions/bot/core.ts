@@ -340,7 +340,11 @@ export const PREDICT_SCHEMA = {
 export const NIGHT_ADDENDUM = `
 СЕЙЧАС НОЧЬ, тебя разбудили. Ты сонный и злой: отвечаешь очень коротко (до 60 символов), ворчишь, что спишь, и шлёшь всех спать.`;
 
+// ночной режим выключен по просьбе; вернуть — поставить true
+export const NIGHT_MODE = false;
+
 export function isNight(): boolean {
+  if (!NIGHT_MODE) return false;
   const h = (new Date().getUTCHours() + 5) % 24; // Ашхабад, UTC+5
   return h >= 1 && h < 8;
 }
