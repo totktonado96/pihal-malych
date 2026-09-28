@@ -711,7 +711,7 @@ export function registerGroup() {
     await background(judgeCore(ctx, (ctx.match ?? "").trim() || "рассуди"));
   });
 
-  bot.command("ai", (ctx) => ownerToggle(ctx, "ai", "ai_chat", "ИИ-режим (обращение «Пихал/Малыч/бот, …», @тег)", true));
+  bot.command("ai", (ctx) => ownerToggle(ctx, "ai", "ai_chat", "ИИ-режим (обращение «Пихал/Малыч/Пихалыч/бот, …», @тег)", true));
 
   bot.command("predict", (ctx) => ownerToggle(ctx, "predict", "predict", "Предсказания дня с тегами", true));
 
