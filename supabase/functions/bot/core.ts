@@ -905,7 +905,6 @@ export async function assistantCore(ctx: any, text: string) {
     await supabase.rpc("bump_counter", { p_key: "ai_asks", p_by: 1 });
     return;
   }
-  if (intent === "chat" && nightSkip()) return; // ночью на болтовню — через раз
   if (reply) await sendTalk("talk", chatId, reply, { reply_parameters: { message_id: msgId } });
   if (intent === "add" && arg) {
     // нейросеть могла «причесать» текст — если её вариант не совпадает с тем, что реально написали, берём написанное

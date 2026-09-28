@@ -936,6 +936,8 @@ export function registerGroup() {
         await ctx.reply(spamWarn(ctx.from?.first_name ?? "друг"), { reply_parameters: { message_id: ctx.msg.message_id } });
         return;
       }
+      // ночью на болтовню — через раз; решаем сразу, до «печатает» и до нейросети (команды словами — всегда)
+      if (!commandLike(text) && nightSkip()) return;
       await ctx.replyWithChatAction("typing").catch(() => {});
       await background(assistantCore(ctx, text));
       return;
@@ -953,12 +955,13 @@ export function registerGroup() {
         await ctx.reply(spamWarn(ctx.from?.first_name ?? "друг"), { reply_parameters: { message_id: ctx.msg.message_id } });
         return;
       }
+      // ночью огрызается через раз — решаем до «печатает», чтобы не «печатать» и молчать
+      if (!wantsCmd && nightSkip()) return;
       await ctx.replyWithChatAction("typing").catch(() => {}); // «печатает…», пока Gemini думает
-      if (commandLike(text) && (await getFlag("ai_chat", true))) {
+      if (wantsCmd) {
         await background(assistantCore(ctx, text));
         return;
       }
-      if (nightSkip()) return; // ночью огрызается через раз
       await background(snapCore(ctx, text));
       return;
     }
